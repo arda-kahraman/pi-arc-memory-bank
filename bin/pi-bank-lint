@@ -1,0 +1,170 @@
+#!/bin/bash
+# pi-bank-lint — mechanical memory-bank consistency checks: the thinning runbook's "final checks"
+# (index<->file consistency both ways, dangling [[links]], hook bloat) plus fresh size outliers.
+# Exists because the memory_write lean gate only sees pi's tool path — Claude Code and direct file
+# edits bypass it; this catches drift from ANY write path within a week (gardener cadence).
+# Quiet-ish and exit 0 when clean; one LINT line per finding and exit 1 otherwise.
+# Usage: pi-bank-lint [--all] [bank-dir ...]   (default: the home bank)
+#
+# ⛔ --all matters more here than it looks. Nothing swept lint across banks until 2026-09-19, while
+# pi-bank-verify has been swept daily since it shipped — so incoherence in project banks accumulated
+# unseen: 80 findings across 9 banks when this was first run over all of them, including a 60KB
+# index costing ~15k tokens in every session of that project. Verification and coherence are
+# different questions and neither implies the other, so both have to be asked on a cadence.
+set -u
+# Resolve through symlinks without `readlink -f` (GNU-only), so the sibling below is found from a
+# ~/.local/bin link as well as from the package.
+self="$0"
+while [ -L "$self" ]; do
+  target=$(ls -ld "$self" | sed "s/.*-> //")
+  case $target in /*) self="$target" ;; *) self="$(dirname "$self")/$target" ;; esac
+done
+HERE=$(cd "$(dirname "$self")" && pwd)
+all=0
+banks=()
+for a in "$@"; do
+  case "$a" in --all) all=1 ;; *) banks+=("$a") ;; esac
+done
+if [ $all -eq 1 ]; then
+  [ ${#banks[@]} -eq 0 ] || { echo "bank-lint: --all takes no bank arguments"; exit 2; }
+  while IFS= read -r d; do banks+=("$d"); done < <(find "$HOME/.claude/projects" -mindepth 2 -maxdepth 2 -type d -name memory -exec test -f '{}/MEMORY.md' \; -print 2>/dev/null | sort)
+  [ ${#banks[@]} -gt 0 ] || { echo "bank-lint: no banks found under $HOME/.claude/projects"; exit 1; }
+fi
+# ⛔ With no argument, lint the bank for the CURRENT DIRECTORY — the same bank the session reads
+# and the same one pi-bank-verify checks. Until 2026-09-20 this defaulted to the home bank no matter
+# where it ran, so a session inside a project ran `pi-bank-lint`, was told "clean", and had in fact
+# linted a different bank entirely. Found by an end-to-end test: the project bank was holding an
+# unindexed note the whole time the default run was reporting clean. That is the house failure mode
+# — a check that did not run looking exactly like a check that passed.
+#
+# Resolution is delegated to `pi-bank-verify --resolve` rather than reimplemented here. The cwd rule
+# already exists twice (extensions/memory-bank.ts and bin/lib/bank-verify.js) and a third copy in
+# bash would be a third thing to keep in step.
+if [ ${#banks[@]} -eq 0 ]; then
+  # ⛔ The sibling, by path — never `pi-bank-verify` from PATH. Until 2026-09-28 it was looked up on
+  # PATH, which a plain install never populates, and the empty answer fell back to the HOME bank:
+  # on a fresh machine every directory silently linted HOME (found by a clean-room install). A
+  # resolution that fails is now an error, not a fallback, for the same reason an early version of
+  # this fix that fell back on `! -d` was wrong: a check of the wrong bank looks exactly like a pass.
+  here=$("$HERE/pi-bank-verify" --resolve 2>/dev/null | tail -1)
+  [ -n "${here:-}" ] || { echo "bank-lint: could not resolve the bank for this directory ($HERE/pi-bank-verify --resolve failed)"; exit 2; }
+  # A directory with no bank is not a lint failure, it is an absence. Say which bank was looked for
+  # so the answer cannot be mistaken for a clean bill of health on some other bank.
+  if [ ! -f "$here/MEMORY.md" ]; then
+    echo "bank-lint: no bank for this directory yet ($here)"
+    exit 0
+  fi
+  banks=("$here")
+  echo "bank-lint: $here"
+fi
+fail=0
+justified=0
+say() { fail=1; echo "$1"; }
+for bank in "${banks[@]}"; do
+  cd "$bank" 2>/dev/null || { say "LINT: cannot cd $bank"; continue; }
+  [ -f MEMORY.md ] || { say "LINT $bank: no MEMORY.md"; continue; }
+  for f in *.md; do
+    [ "$f" = MEMORY.md ] && continue
+    grep -qF "($f)" MEMORY.md || say "LINT $bank: no index line for $f"
+  done
+  while read -r t; do
+    [ -f "$t" ] || say "LINT $bank: index references missing file $t"
+  done < <(grep -oP '\(\K[a-zA-Z0-9._-]+\.md(?=\))' MEMORY.md | sort -u)
+  # ponytail: fixed ignore list for meta-placeholder [[..]] mentions (runbook/guideline prose),
+  # instead of parsing code-span context; extend the list if a new false positive appears.
+  # A project bank may legitimately point at the machine bank: machine facts live there by design,
+  # and every session in a project can read it. Found 2026-09-20 when a session testing this system
+  # wrote "[[headless-firefox-page-tests]] in the machine bank" from a project bank — it had scoped
+  # the two notes correctly, said out loud which bank it meant, and lint still called the link
+  # dangling. The agent's intent was right and the checker had no way to express it.
+  # ⚠ One direction only. The machine bank must not depend on a project bank, which can be deleted
+  # with its project; a link that way stays dangling and should.
+  home_bank="$HOME/.claude/projects/$(printf '%s' "$HOME" | sed 's/[^a-zA-Z0-9]/-/g')/memory"
+  while read -r l; do
+    case "$l" in links|wiki-links|name|their-name|'-t 0') continue ;; esac
+    # A link names a note: code that happens to nest brackets (`[["pkg", {…}]]`) is not one.
+    [[ $l =~ ^[A-Za-z0-9][A-Za-z0-9._\ -]*$ ]] || continue
+    [ -f "$l.md" ] && continue
+    if [ "$bank" != "$home_bank" ] && [ -f "$home_bank/$l.md" ]; then continue; fi
+    say "LINT $bank: dangling [[${l}]]"
+  done < <(grep -hoP '\[\[\K[^\]]+(?=\]\])' -- *.md | sort -u)
+  while IFS= read -r line; do
+    say "LINT $bank: index line over 280 chars (hook bloat): ${line:0:70}..."
+  done < <(awk 'length > 280' MEMORY.md)
+  # The index is injected into EVERY session opened in this directory, so its size is rent rather
+  # than a one-off. Measured 2026-09-19 on synthetic banks: roughly 28 tokens per note — ~2.8k
+  # tokens at 100 notes, ~17k at 600, ~34k at 1200 — while verify stays under 70ms and lint under
+  # 1.1s even at 1200. The tooling is never the constraint here; the prompt budget is, and nothing
+  # was watching it. 40000 bytes is about 10k tokens a session, which is where it stops being noise.
+  idx_bytes=$(wc -c < MEMORY.md)
+  if [ "$idx_bytes" -gt 40000 ]; then
+    say "LINT $bank: index is ${idx_bytes} bytes (~$((idx_bytes / 4)) tokens in EVERY session here) — thin the bank or split the project"
+  fi
+  # Flags only files that are BOTH over the gate ceiling (~8000-char bodies; byte size is a close
+  # proxy) AND grew vs their git baseline (newest rev older than 8 days, else the file's first
+  # rev) — shrinking edits and standing sizeJustified consolidations stay quiet; an uncommitted
+  # fresh oversized file has no rev at all and always flags. Non-git banks fall back to the old
+  # touched-this-week mtime heuristic.
+  while read -r f; do
+    # A warning you cannot resolve is one everybody learns to ignore, and this one told you to
+    # "confirm it is a justified consolidation" without offering any way to record the confirmation.
+    # `size_justified: <reason>` in the frontmatter is that record: greppable, reviewable in a diff,
+    # and counted below so a justified file stays visible instead of disappearing.
+    # Indented as well as top-level: Claude Code normalises frontmatter on update and moves custom
+    # keys inside the metadata: block, so a note it has touched carries `  size_justified:`. Matching
+    # only at column 0 meant the justification silently stopped counting.
+    if grep -qE '^[[:space:]]*size_justified:' "$f"; then
+      justified=$((justified + 1))
+      continue
+    fi
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      gitpath="$(git rev-parse --show-prefix)$f"
+      base=$(git rev-list -1 --before='8 days ago' HEAD -- "$f" 2>/dev/null)
+      [ -n "$base" ] || base=$(git rev-list HEAD -- "$f" 2>/dev/null | tail -1)
+      if [ -n "$base" ]; then
+        [ "$(wc -c < "$f")" -gt "$(git show "$base:$gitpath" 2>/dev/null | wc -c)" ] || continue
+      fi
+    else
+      [ -n "$(find "$f" -mtime -8)" ] || continue
+    fi
+    say "LINT $bank: $f is >8000 bytes and grew this week — thin it or confirm it is a justified consolidation"
+  done < <(find . -maxdepth 1 -name '*.md' ! -name MEMORY.md -size +8000c -exec basename {} \;)
+  # Content hygiene, for every write path: memory_write checks what pi stores, but Claude Code and
+  # hand edits write here too. Same patterns as the tool (src/memory-bank.ts SECRET, RELATIVE).
+  # A credential is masked in the report, so the report does not leak it.
+  while IFS=: read -r f hit; do
+    [ -n "$f" ] && say "LINT $bank: $f holds a credential-shaped string (${hit:0:6}…) — remove the value, record where it lives"
+  done < <(grep -oiE '(sk-(ant-|live-|proj-)?[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|eyJ[A-Za-z0-9_-]{15,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|(private_?key|preshared_?key)["'\'']?[[:space:]]*[:=][[:space:]]*["'\'']?[A-Za-z0-9+/]{42,}={0,2}|(password|passwd|api[_-]?key|secret|token|bearer)["'\'']?[[:space:]]*[:=][[:space:]]*["'\'']?[A-Za-z0-9/+_.-]{16,})' -- *.md 2>/dev/null \
+    | awk -F: '{ v = $0; sub(/^[^:]*:/, "", v); if (tolower(v) ~ /^(password|passwd|api[_-]?key|secret|token|bearer)/ && (v !~ /[0-9]/ || v ~ /(process\.env|os\.environ|import\.meta)/)) next; if (!seen[$1]++) print }')
+  # A relative date is wrong the day after it is written. RELATIVE-OK on the line marks a generic use
+  # ("today's reading" meaning the present), like PORTABILITY-OK elsewhere in this repo.
+  while IFS=: read -r f n line; do
+    [ -n "$f" ] && say "LINT $bank: $f:$n uses a relative date — write the date: ${line:0:70}"
+  done < <(grep -nwiE 'today|yesterday|tomorrow|tonight|this morning|this afternoon|last (night|week|month)|next (week|month|year|monday|tuesday|wednesday|thursday|friday|saturday|sunday)' -- *.md 2>/dev/null | grep -v 'RELATIVE-OK' | grep -v '^MEMORY\.md:')
+  # A new feedback/project note leads with its reason. Only notes first added in the last 8 days, so
+  # the older notes written before the rule do not drown the finding.
+  for f in *.md; do
+    [ "$f" = MEMORY.md ] && continue
+    grep -qE '^[[:space:]]*type:[[:space:]]*(feedback|project)' "$f" || continue
+    grep -qE '\*\*Why:?\*\*' "$f" && continue
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      added=$(git log --diff-filter=A --format=%ct -- "$f" 2>/dev/null | tail -1)
+      [ -n "$added" ] && [ "$added" -lt "$(( $(date +%s) - 8 * 86400 ))" ] && continue
+    else
+      [ -n "$(find "$f" -mtime -8)" ] || continue
+    fi
+    say "LINT $bank: $f is a new $(grep -oE '^[[:space:]]*type:[[:space:]]*(feedback|project)' "$f" | head -1 | sed 's/.*://; s/ //g') note with no **Why:** line"
+  done
+  # ⛔ The loop above only ever sees files OVER the ceiling, so a note that has since been thinned
+  # keeps its size_justified forever — invisible, and silently pre-authorising it to grow all the
+  # way back with nothing flagging it. That is the same ratchet as a VERIFY-OK nobody revisits.
+  # A justification is a claim about the note's shape; when the note stops being oversized the claim
+  # has expired and the line should go.
+  while read -r f; do
+    [ -n "$f" ] || continue
+    say "LINT $bank: $f carries size_justified but is only $(wc -c < "$f") bytes — the justification has expired, drop it"
+  done < <(grep -lE '^[[:space:]]*size_justified:' -- *.md 2>/dev/null | while read -r g; do [ "$(wc -c < "$g")" -le 8000 ] && echo "$g"; done)
+done
+[ $justified -gt 0 ] && echo "bank-lint: $justified oversized file(s) carry size_justified"
+[ $fail -eq 0 ] && echo "bank-lint: clean"
+exit $fail

@@ -1,0 +1,4 @@
+{
+  "//": "Node decides a script's module system from the nearest package.json. This package says \"type\": \"module\" because its extension is ESM; bank-verify.js is CommonJS, so it declares that here rather than being rewritten to suit a loader detail. Same reason as the repo's own bin/package.json.",
+  "type": "commonjs"
+}

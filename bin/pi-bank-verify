@@ -1,0 +1,126 @@
+#!/bin/bash
+# pi-bank-verify — does the bank still describe the machine it claims to describe?
+#
+#   pi-bank-verify                    check the home bank
+#   pi-bank-verify --quiet            drift only; the unchecked count still shows in the summary
+#   pi-bank-verify --json             machine-readable, for a scheduled sweep
+#   pi-bank-verify --resolve [dir]    print which bank a directory resolves to, and check nothing
+#   pi-bank-verify <dir> [<dir> ...]  check specific banks
+#
+# PI_MEMORY_BANK_DIR pins the bank, overriding directory resolution. ⚠ sudo STRIPS it, silently, so
+# `sudo pi-bank-verify` with a pin set checks the cwd-resolved bank instead and says nothing about
+# it. Use `sudo -E` to keep the pin.
+#
+# pi-bank-lint asks whether the bank is internally consistent — every note indexed, no dangling
+# [[links]], no bloated entries. This asks the other question: are the claims still TRUE of this
+# machine. Both are needed and neither implies the other; a perfectly tidy bank can be uniformly
+# wrong about where its own files live.
+#
+# ⛔ This tool runs NO commands, from note body text or frontmatter. The execution path was deleted
+# rather than guarded: the bank is a control plane — these notes carry ⛔ rules an agent obeys — and
+# a persistent store is a demonstrated injection surface.
+#
+# ⛔ What green does NOT mean: this verifies paths, the least dangerous content in a note. The
+# authority is in the ⛔ rules themselves, and nothing checks those. A note instructing an agent to
+# do something catastrophic verifies clean.
+#
+# Exit 1 on drift or an integrity finding, 0 when clean. Unchecked claims never fail the run: they
+# are not evidence of a problem, they are an honest admission that this tool could not tell.
+# An integrity finding does fail it — it means the bank could not be read unambiguously, which is
+# not a state to report as success.
+set -uo pipefail
+
+self="$0"
+while [ -L "$self" ]; do
+  target=$(ls -ld "$self" | sed "s/.*-> //")
+  case $target in /*) self="$target" ;; *) self="$(dirname "$self")/$target" ;; esac
+done
+HERE=$(cd "$(dirname "$self")" && pwd)
+PKG=$(dirname "$HERE")   # the package root: bin/ sits inside it, lib/ beside bin/
+
+flags=()
+banks=()
+all=0
+resolve=0
+for a in "$@"; do
+  case "$a" in
+    --all) all=1 ;;
+    # ⛔ --resolve must be handled HERE, not forwarded. The library's --resolve takes a directory to
+    # resolve FROM; the wrapper resolves the bank first and then passed that bank as the argument,
+    # so the bank path got slugged a second time and the answer was a directory that never exists:
+    # -home-user--claude-projects--home-user-memory. Broken with and without sudo.
+    --resolve) resolve=1 ;;
+    --*) flags+=("$a") ;;
+    *) banks+=("$a") ;;
+  esac
+done
+
+# Under sudo, $HOME is root's, so both the bank slug and every ~ in a note would resolve to the
+# wrong user. Elevation is the only way to check root-only paths (/etc/sudoers.d, /etc/wireguard),
+# so `sudo pi-bank-verify` has to keep pointing at the invoking user's bank and home.
+if [ -n "${SUDO_USER:-}" ]; then
+  sudo_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+  [ -n "$sudo_home" ] && export HOME="$sudo_home"
+fi
+
+if [ $resolve -eq 1 ]; then
+  # Answer for the directory asked about (or $PWD), after the sudo HOME fix above so the answer is
+  # the invoking user's bank rather than root's.
+  node "$PKG/lib/bank-verify.js" --resolve "${banks[0]:-$PWD}"
+  exit $?
+fi
+
+# Resolve the bank the way pi does — from the CURRENT DIRECTORY, not from $HOME. A session working
+# in ~/Dev/PathoSense reads the PathoSense bank, so checking the home bank from there verifies a
+# file nobody in that session will open. The rule (exact-cwd bank, else nearest project root,
+# worktree-aware) lives in bin/lib/bank-verify.js as a mirror of extensions/memory-bank.ts.
+auto=0
+if [ $all -eq 1 ]; then
+  [ ${#banks[@]} -eq 0 ] || { echo "bank-verify: --all takes no bank arguments"; exit 2; }
+  while IFS= read -r d; do banks+=("$d"); done < <(find "$HOME/.claude/projects" -mindepth 2 -maxdepth 2 -type d -name memory -exec test -f '{}/MEMORY.md' \; -print 2>/dev/null | sort)
+  [ ${#banks[@]} -gt 0 ] || { echo "bank-verify: no banks found under $HOME/.claude/projects"; exit 1; }
+elif [ ${#banks[@]} -eq 0 ]; then
+  auto=1
+  banks=("$(node "$PKG/lib/bank-verify.js" --resolve "$PWD")")
+fi
+
+# ⛔ --json must emit ONE parseable document. With several banks this printed a ── header before
+# each one and then N separate top-level objects, so the documented "for a scheduled sweep" mode
+# produced something no JSON parser accepts. Multi-bank JSON is wrapped in an array and the headers
+# are suppressed; the bank name is already inside each object.
+json=0
+for f in ${flags[@]+"${flags[@]}"}; do [ "$f" = "--json" ] && json=1; done
+multi=0
+[ ${#banks[@]} -gt 1 ] && multi=1
+if [ $json -eq 1 ] && [ $multi -eq 1 ]; then
+  printf '[\n'
+  first=1
+  rc=0
+  for bank in "${banks[@]}"; do
+    [ -d "$bank" ] || continue
+    [ $first -eq 1 ] || printf ',\n'
+    first=0
+    node "$PKG/lib/bank-verify.js" "$bank" ${flags[@]+"${flags[@]}"} || rc=1
+  done
+  printf '\n]\n'
+  exit $rc
+fi
+
+rc=0
+for bank in "${banks[@]}"; do
+  if [ ! -d "$bank" ]; then
+    # A project that has not written a memory yet is not a fault — pi would create the bank on the
+    # first write. Only an explicitly-named missing directory is a user error worth failing on,
+    # which matters because check 15 and any CI caller run this from wherever they happen to be.
+    if [ $auto -eq 1 ]; then
+      echo "bank-verify: no bank for this directory yet ($bank)"
+    else
+      echo "bank-verify: no such bank $bank"; rc=1
+    fi
+    continue
+  fi
+  # With several banks the totals are meaningless without knowing whose they are.
+  [ $multi -eq 1 ] && echo "── ${bank#$HOME/.claude/projects/}"
+  node "$PKG/lib/bank-verify.js" "$bank" ${flags[@]+"${flags[@]}"} || rc=1
+done
+exit $rc
