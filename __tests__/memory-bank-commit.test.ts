@@ -109,6 +109,21 @@ describe("commitWrite", () => {
     fs.rmSync(d, { recursive: true, force: true });
   });
 
+  // ⛔ A bank folder inside a project repo without a repo of its own must not commit into the project.
+  test("a bank inside someone else's repo is never committed into it", () => {
+    const outer = fs.mkdtempSync(path.join(os.tmpdir(), "bank-outer-"));
+    execFileSync("git", ["init", "-q"], { cwd: outer, stdio: "ignore" });
+    const d = path.join(outer, ".pi", "memory");
+    fs.mkdirSync(d, { recursive: true });
+    write(d, "a.md", "note\n");
+    expect(commitWrite(d, ["a.md"], "memory(save): A")).toBeNull();
+    expect(execFileSync("git", ["status", "--porcelain"], { cwd: outer, encoding: "utf8" })).not.toContain("A ");
+    let commits = "";
+    try { commits = execFileSync("git", ["log", "--oneline"], { cwd: outer, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }); } catch { /* no commits */ }
+    expect(commits).toBe("");
+    fs.rmSync(outer, { recursive: true, force: true });
+  });
+
   test("nothing to commit is a null, not a failure", () => {
     const d = bank();
     expect(commitWrite(d, ["MEMORY.md"], "memory(save): nothing changed")).toBeNull();

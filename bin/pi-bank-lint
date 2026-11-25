@@ -4,7 +4,7 @@
 # Exists because the memory_write lean gate only sees pi's tool path — Claude Code and direct file
 # edits bypass it; this catches drift from ANY write path within a week (gardener cadence).
 # Quiet-ish and exit 0 when clean; one LINT line per finding and exit 1 otherwise.
-# Usage: pi-bank-lint [--all] [bank-dir ...]   (default: the home bank)
+# Usage: pi-bank-lint [--all] [bank-dir ...]   (default: this directory's bank; --all adds the machine bank)
 #
 # ⛔ --all matters more here than it looks. Nothing swept lint across banks until 2026-09-19, while
 # pi-bank-verify has been swept daily since it shipped — so incoherence in project banks accumulated
@@ -27,8 +27,12 @@ for a in "$@"; do
 done
 if [ $all -eq 1 ]; then
   [ ${#banks[@]} -eq 0 ] || { echo "bank-lint: --all takes no bank arguments"; exit 2; }
-  while IFS= read -r d; do banks+=("$d"); done < <(find "$HOME/.claude/projects" -mindepth 2 -maxdepth 2 -type d -name memory -exec test -f '{}/MEMORY.md' \; -print 2>/dev/null | sort)
-  [ ${#banks[@]} -gt 0 ] || { echo "bank-lint: no banks found under $HOME/.claude/projects"; exit 1; }
+  # Project banks live inside their projects (<project>/.pi/memory), so they cannot be listed from
+  # here: --all is the machine bank plus this directory's bank.
+  for d in "${PI_MEMORY_BANK_MACHINE_DIR:-$HOME/.pi/agent/memory}" "$("$HERE/pi-bank-verify" --resolve 2>/dev/null | tail -1)"; do
+    [ -f "$d/MEMORY.md" ] && [[ " ${banks[*]-} " != *" $d "* ]] && banks+=("$d")
+  done
+  [ ${#banks[@]} -gt 0 ] || { echo "bank-lint: no machine bank and no bank for this directory"; exit 1; }
 fi
 # ⛔ With no argument, lint the bank for the CURRENT DIRECTORY — the same bank the session reads
 # and the same one pi-bank-verify checks. Until 2026-09-20 this defaulted to the home bank no matter
@@ -79,7 +83,7 @@ for bank in "${banks[@]}"; do
   # dangling. The agent's intent was right and the checker had no way to express it.
   # ⚠ One direction only. The machine bank must not depend on a project bank, which can be deleted
   # with its project; a link that way stays dangling and should.
-  home_bank="$HOME/.claude/projects/$(printf '%s' "$HOME" | sed 's/[^a-zA-Z0-9]/-/g')/memory"
+  home_bank="${PI_MEMORY_BANK_MACHINE_DIR:-$HOME/.pi/agent/memory}"
   while read -r l; do
     case "$l" in links|wiki-links|name|their-name|'-t 0') continue ;; esac
     # A link names a note: code that happens to nest brackets (`[["pkg", {…}]]`) is not one.

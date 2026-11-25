@@ -41,15 +41,24 @@ describe("initBankGit", () => {
     fs.rmSync(d, { recursive: true, force: true });
   });
 
-  // Initialising inside an existing repo would shadow it: the bank's history would silently become
-  // a second, empty one, and `git log` in the parent would stop showing the notes.
-  test("a bank nested inside an existing repo is left alone", () => {
+  // A project bank is <project>/.pi/memory. Committing into the project's repo would put the notes
+  // in its history and on GitHub with the next push, so the bank gets its own repo and the project
+  // ignores it through its local exclude file (no project file changes).
+  test("a bank inside a project repo gets its own repo, hidden from the project", () => {
     const outer = mkTmp();
     execFileSync("git", ["init", "-q"], { cwd: outer, stdio: "ignore" });
-    const inner = path.join(outer, "memory");
-    fs.mkdirSync(inner);
+    const inner = path.join(outer, ".pi", "memory");
+    fs.mkdirSync(inner, { recursive: true });
+    fs.writeFileSync(path.join(inner, "a.md"), "note\n");
+    expect(initBankGit(inner)).toBe(true);
+    expect(fs.existsSync(path.join(inner, ".git"))).toBe(true);
+    expect(fs.readFileSync(path.join(outer, ".git", "info", "exclude"), "utf8")).toContain("/.pi/memory/\n");
+    const status = execFileSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: outer, encoding: "utf8" });
+    expect(status).toBe("");
+    // a second call is a no-op and adds no second exclude line
     expect(initBankGit(inner)).toBe(false);
-    expect(fs.existsSync(path.join(inner, ".git"))).toBe(false);
+    const lines = fs.readFileSync(path.join(outer, ".git", "info", "exclude"), "utf8").split("\n");
+    expect(lines.filter((l) => l === "/.pi/memory/").length).toBe(1);
     fs.rmSync(outer, { recursive: true, force: true });
   });
 

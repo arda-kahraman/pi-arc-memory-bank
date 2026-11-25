@@ -1,16 +1,13 @@
-// memory-bank.ts — put the Claude Code memory bank for THIS working directory into pi's cached prefix.
+// memory-bank.ts — put the memory bank for THIS working directory into pi's cached prefix.
 //
 // Why: pi's AGENTS.md only told the agent a bank existed, so recall was pull-based — two tool
-// round-trips and entirely dependent on the model deciding to look. Claude Code instead has the
-// index in context from turn one. This does the same, for the bank belonging to the directory pi
-// was started in.
+// round-trips and entirely dependent on the model deciding to look. This puts the index in context
+// from turn one, for the bank belonging to the directory pi was started in.
 //
 // BANK RESOLUTION (the part that makes it correct rather than merely present):
-// Claude Code stores each project's memories under ~/.claude/projects/<slug>/memory, where <slug>
-// is the project's absolute path with every non-alphanumeric character replaced by "-"
-// (/run/media/arc/OS/Dev/PathoSense -> -run-media-arc-OS-Dev-PathoSense). This resolves the bank
-// from the session cwd the same way, in this order:
-//   1. a bank for the exact cwd, if one exists;
+// A project's bank is <project>/.pi/memory, beside pi's other per-project files; the machine-wide
+// bank is ~/.pi/agent/memory. The bank is resolved from the session cwd in this order:
+//   1. <cwd>/.pi/memory, if it has an index;
 //   2. otherwise the bank of the enclosing PROJECT ROOT — nearest ancestor holding .git or a
 //      manifest — so a session started in <project>/docs uses <project>'s bank, and a project with
 //      no bank yet gets the bank path for its own root (created on first write);
@@ -55,13 +52,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-const PROJECTS_ROOT = path.join(os.homedir(), ".claude", "projects");
-// Derived, not hardcoded to "-home-user": the slug rule already yields that for /home/user, and
-// deriving it keeps the extension correct under a different user or home path (and makes it
-// testable against a sandbox HOME, where a hardcoded name silently points at a bank nobody uses).
 // PI_MEMORY_BANK_MACHINE_DIR pins it the way PI_MEMORY_BANK_DIR pins the project bank: a trial
-// run with a real HOME (the Claude bridge needs one) must never write the real machine bank.
-const HOME_BANK = process.env.PI_MEMORY_BANK_MACHINE_DIR || path.join(PROJECTS_ROOT, os.homedir().replace(/[^a-zA-Z0-9]/g, "-"), "memory");
+// run with a real HOME must never write the real machine bank.
+const HOME_BANK = process.env.PI_MEMORY_BANK_MACHINE_DIR || path.join(os.homedir(), ".pi", "agent", "memory");
 const PINNED_BANK = process.env.PI_MEMORY_BANK_DIR || "";
 const ALSO_GLOBAL = (process.env.PI_MEMORY_BANK_SCOPE ?? "").toLowerCase() === "both";
 
@@ -114,15 +107,7 @@ function textBlock(text: string, color: (s: string) => string) {
 }
 
 function bankForPath(dir: string): string {
-  const slug = dir.replace(/[^a-zA-Z0-9]/g, "-");
-  // Filenames cap at 255 bytes, and a deep cwd overruns it (mkdir ENAMETOOLONG on save). Claude
-  // Code would fail on such a path too, so nothing is lost by diverging here; keeping the head of
-  // the slug keeps the directory recognisable, and the hash keeps it unique.
-  const safe =
-    slug.length <= 200
-      ? slug
-      : `${slug.slice(0, 180)}-${crypto.createHash("sha1").update(slug).digest("hex").slice(0, 12)}`;
-  return path.join(PROJECTS_ROOT, safe, "memory");
+  return path.join(dir, ".pi", "memory");
 }
 
 type Resolved = { dir: string; via: string; project: boolean; exists: boolean };
@@ -538,24 +523,36 @@ function writeAtomic(file: string, text: string): void {
 // and worth reading, and a tool that auto-commits every save would replace them with noise. The
 // save response states the obligation instead. Best-effort throughout — a missing git binary or a
 // failed init must never cost the note, which is the thing actually being asked for.
+//
+// A bank is always its OWN repo. A project bank sits inside the project (<project>/.pi/memory),
+// and committing notes into the project's repo would put them in its history, and on GitHub with
+// the next push. So a bank inside a repo gets a nested repo, and the enclosing repo ignores it
+// through its local .git/info/exclude (never committed, so no project file changes).
 export function initBankGit(dir: string): boolean {
-  const git = (args: string[]) =>
-    execFileSync("git", args, { cwd: dir, stdio: ["ignore", "pipe", "ignore"], encoding: "utf8" });
+  if (isOwnRepo(dir)) return false;
+  const outer = git(dir, ["rev-parse", "--show-toplevel"]);
+  if (git(dir, ["init", "-q"]) === null) return false;
   try {
-    // Already covered by a repo (a bank nested under one) — initialising again would shadow it.
-    git(["rev-parse", "--show-toplevel"]);
-    return false;
-  } catch {
-    /* not in a repo: that is the case worth fixing */
-  }
-  try {
-    git(["init", "-q"]);
     const ignore = path.join(dir, ".gitignore");
     if (!fs.existsSync(ignore)) fs.writeFileSync(ignore, ".MEMORY.md.lock\n", "utf8");
-    return true;
+    if (outer) {
+      const exclude = path.resolve(outer, git(outer, ["rev-parse", "--git-path", "info/exclude"]) ?? ".git/info/exclude");
+      const line = `/${path.relative(outer, dir).split(path.sep).join("/")}/`;
+      const have = fs.existsSync(exclude) ? fs.readFileSync(exclude, "utf8") : "";
+      if (!have.split(/\r?\n/).includes(line)) {
+        fs.mkdirSync(path.dirname(exclude), { recursive: true });
+        fs.appendFileSync(exclude, `${have && !have.endsWith("\n") ? "\n" : ""}${line}\n`, "utf8");
+      }
+    }
   } catch {
-    return false;
+    /* the repo exists; a missed ignore line only shows the bank as untracked in the project */
   }
+  return true;
+}
+
+// True when dir is the top of its own repo, not a folder inside some other repo.
+function isOwnRepo(dir: string): boolean {
+  return git(dir, ["rev-parse", "--git-dir"]) === ".git";
 }
 
 // ── the write is the transaction, and the transaction is the broadcast ───────────────────────
@@ -595,7 +592,8 @@ export function markBankSeen(dir: string): void {
 // this commit — the one thing a shared bank must never do — and `-- <paths>` on the commit means
 // even a change a sibling has already STAGED cannot ride along on ours.
 export function commitWrite(dir: string, files: string[], subject: string): string | null {
-  if (git(dir, ["rev-parse", "--git-dir"]) === null) return null;
+  // ⛔ Never into an enclosing repo: that would be the project's history (see initBankGit).
+  if (!isOwnRepo(dir)) return null;
   // initBankGit writes .gitignore and deliberately does not commit, so without this the very first
   // write leaves it untracked and EVERY later write reports a phantom "uncommitted path" from a
   // writer that does not exist. A feed that cries wolf once per write is a feed nobody reads.

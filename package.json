@@ -1,6 +1,6 @@
 {
   "name": "pi-arc-memory-bank",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
   "private": true,
   "description": "Notes that last between pi sessions: a per-project and a machine-wide bank of Markdown notes, an index injected once per session, and the memory-curation skill.",

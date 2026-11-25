@@ -1,6 +1,6 @@
 # pi-arc-memory-bank
 
-A durable memory bank for [pi](https://github.com/earendil-works/pi), shared with Claude Code —
+A durable memory bank for [pi](https://github.com/earendil-works/pi):
 injected once per session, verifiable against the machine, and linted for the collector's fallacy.
 
 ```
@@ -16,14 +16,19 @@ Markdown notes in a per-directory bank, plus an index that is injected into the 
 turn would invalidate the prompt cache each time a note changed, so the index you start with is the
 index you keep, and later edits land on disk for the next session.
 
-The bank lives beside Claude Code's, so both agents read and write the same notes:
+Banks live in pi's own folders:
 
 ```
-~/.claude/projects/<slugged-cwd>/memory/     project bank
-~/.claude/projects/-home-<user>/memory/      machine-wide facts
+<project>/.pi/memory/       project bank (the project root: the nearest folder with .git or a manifest)
+~/.pi/agent/memory/         machine-wide facts
 ```
 
 Worktrees resolve to the main repo's bank. `PI_MEMORY_BANK_DIR` overrides everything.
+
+Each bank is its own git repo, so an edit keeps the old value in history. A project bank inside a
+git project gets a nested repo and a line in the project's local `.git/info/exclude`: the notes
+never enter the project's history, and no project file changes. To share a project's notes, push
+the bank's own repo.
 
 ## The tools
 

@@ -1,7 +1,8 @@
 #!/bin/bash
 # pi-bank-verify — does the bank still describe the machine it claims to describe?
 #
-#   pi-bank-verify                    check the home bank
+#   pi-bank-verify                    check this directory's bank
+#   pi-bank-verify --all              this directory's bank and the machine bank
 #   pi-bank-verify --quiet            drift only; the unchecked count still shows in the summary
 #   pi-bank-verify --json             machine-readable, for a scheduled sweep
 #   pi-bank-verify --resolve [dir]    print which bank a directory resolves to, and check nothing
@@ -77,8 +78,12 @@ fi
 auto=0
 if [ $all -eq 1 ]; then
   [ ${#banks[@]} -eq 0 ] || { echo "bank-verify: --all takes no bank arguments"; exit 2; }
-  while IFS= read -r d; do banks+=("$d"); done < <(find "$HOME/.claude/projects" -mindepth 2 -maxdepth 2 -type d -name memory -exec test -f '{}/MEMORY.md' \; -print 2>/dev/null | sort)
-  [ ${#banks[@]} -gt 0 ] || { echo "bank-verify: no banks found under $HOME/.claude/projects"; exit 1; }
+  # Project banks live inside their projects (<project>/.pi/memory), so they cannot be listed from
+  # here: --all is the machine bank plus this directory's bank.
+  for d in "${PI_MEMORY_BANK_MACHINE_DIR:-$HOME/.pi/agent/memory}" "$(node "$PKG/lib/bank-verify.js" --resolve "$PWD")"; do
+    [ -f "$d/MEMORY.md" ] && [[ " ${banks[*]-} " != *" $d "* ]] && banks+=("$d")
+  done
+  [ ${#banks[@]} -gt 0 ] || { echo "bank-verify: no machine bank and no bank for this directory"; exit 1; }
 elif [ ${#banks[@]} -eq 0 ]; then
   auto=1
   banks=("$(node "$PKG/lib/bank-verify.js" --resolve "$PWD")")
@@ -120,7 +125,7 @@ for bank in "${banks[@]}"; do
     continue
   fi
   # With several banks the totals are meaningless without knowing whose they are.
-  [ $multi -eq 1 ] && echo "── ${bank#$HOME/.claude/projects/}"
+  [ $multi -eq 1 ] && echo "── $bank"
   node "$PKG/lib/bank-verify.js" "$bank" ${flags[@]+"${flags[@]}"} || rc=1
 done
 exit $rc

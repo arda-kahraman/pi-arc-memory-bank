@@ -228,7 +228,7 @@ worth less than the drift was.
 
 ```
 pi-bank-verify                 # the bank for THIS directory: pass / drifted / unchecked
-pi-bank-verify --all           # every bank under ~/.claude/projects that has a MEMORY.md
+pi-bank-verify --all           # this directory's bank and the machine bank (~/.pi/agent/memory)
 pi-bank-verify --quiet         # drift only; the unchecked count still shows in the summary
 pi-bank-verify --json          # for a scheduled sweep; carries hosts and integrity findings
 sudo pi-bank-verify            # also resolves root-only paths (/etc/sudoers.d, /etc/wireguard)
@@ -236,7 +236,8 @@ pi-bank-lint                   # the other question: is the bank internally cons
 ```
 
 ⚠ Because the bank is resolved from the working directory, **never rely on a bare call from a
-service whose directory you do not control**. Use `--all` for anything scheduled. Project banks are
+service whose directory you do not control**. A scheduled check runs in each project's folder, or
+names the bank (`<project>/.pi/memory`) as an argument. Project banks are
 the ones nobody looks at, and they are where unchecked claims accumulate.
 
 ⚠ `sudo` changes the answer twice over. Its pass set is a superset of the unprivileged one, so the
